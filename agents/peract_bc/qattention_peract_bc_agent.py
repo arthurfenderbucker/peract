@@ -24,6 +24,7 @@ from helpers.optim.lamb import Lamb
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from agents.guidance import guide
 NAME = 'QAttentionAgent'
 
 
@@ -52,7 +53,9 @@ class QFunction(nn.Module):
         indices = torch.cat([((idxs // h) // d), (idxs // h) % w, idxs % w], 1)
         return indices
 
+    
     def choose_highest_action(self, q_trans, q_rot_grip, q_collision):
+        
         coords = self._argmax_3d(q_trans)
         rot_and_grip_indicies = None
         ignore_collision = None
@@ -422,7 +425,7 @@ class QAttentionPerActBCAgent(Agent):
         coords, \
         rot_and_grip_indicies, \
         ignore_collision_indicies = self._q.choose_highest_action(q_trans, q_rot_grip, q_collision)
-
+    
         q_trans_loss, q_rot_loss, q_grip_loss, q_collision_loss = 0., 0., 0., 0.
 
         # translation one-hot
@@ -571,10 +574,115 @@ class QAttentionPerActBCAgent(Agent):
         q_ignore_collisions = self._softmax_ignore_collision(q_ignore_collisions) \
             if q_ignore_collisions is not None else q_ignore_collisions
 
-        # argmax Q predictions
-        coords, \
-        rot_and_grip_indicies, \
-        ignore_collisions = self._q.choose_highest_action(q_trans, q_rot_grip, q_ignore_collisions)
+
+
+        guidance_func_file = "/home/arthur/Desktop/CMU/research/benchmarks/peract/agents/guidance_func.py"
+        if guidance_func_file is None:
+            print("--------------------- NO GUIDANCE ---------------------")
+
+            # argmax Q predictions
+            coords, \
+            rot_and_grip_indicies, \
+            ignore_collisions = self._q.choose_highest_action(q_trans, q_rot_grip, q_ignore_collisions)
+
+            print(coords, rot_and_grip_indicies, ignore_collisions)
+        else:
+            print("--------------------- GUIDING ---------------------")
+
+            # all_coords=torch.stack(torch.meshgrid([torch.arange(i) for i in vox_grid.shape[-3:]]), dim=-1).reshape(-1, len(vox_grid.shape[-3:])).shape
+
+            def topk_3d(tensor_orig, k=100):
+                b, c, d, h, w = tensor_orig.shape  # c will be one
+                idxs = torch.topk(tensor_orig.view(b, c, -1), k, dim=-1).indices
+                indices = torch.cat([((idxs // h) // d), (idxs // h) % w, idxs % w], 1).view(b,c,k, 3)
+                return indices
+
+            def input_to_state(model_output):
+
+                q_trans_, q_rot_grip_, q_ignore_collisions_ = model_output
+                print("shapes q_trans_: ", q_trans_.shape, "\t q_rot_grip_: ",q_rot_grip_.shape, "\t q_ignore_collisions_: ", q_ignore_collisions_.shape)
+                print("self._rotation_resolution ",self._rotation_resolution)
+                top_coords_idx = topk_3d(q_trans_, k=1000)
+                
+                top_coords = bounds[:, :3] + res * top_coords_idx + res / 2
+                top_coords = top_coords.squeeze(1)
+                # print(top_coords.shape)
+
+                if q_rot_grip_ is not None:
+                    q_rot = torch.stack(torch.split(
+                        q_rot_grip_[:, :-2],
+                        int(360 // self._rotation_resolution),
+                        dim=1), dim=1)
+                    
+                    # print("q_rot: ", q_rot.shape)
+                    rot_and_grip_indicies = torch.cat(
+                        [q_rot[:, 0:1].argmax(-1),
+                        q_rot[:, 1:2].argmax(-1),
+                        q_rot[:, 2:3].argmax(-1),
+                        q_rot_grip_[:, -2:].argmax(-1, keepdim=True)], -1)
+                    # print("rot_and_grip_indicies: ",rot_and_grip_indicies.shape )
+                    # ignore_collision = q_collision[:, -2:].argmax(-1, keepdim=True)
+
+                    rot_and_grip = rot_and_grip_indicies[:, :3]*self._rotation_resolution
+                    rot_and_grip = torch.cat([rot_and_grip, rot_and_grip_indicies[:, 3:]], -1)
+
+                    #stack to rot_and_grip to the num of top_coords
+                    rot_and_grip = rot_and_grip.unsqueeze(1).repeat(1, top_coords.shape[1], 1)
+                    # print("rot_and_grip: ",rot_and_grip.shape )
+                
+                    states = torch.cat([top_coords,rot_and_grip ], dim=-1)
+                    # print("state: ",states.shape )
+
+                return states, top_coords_idx
+            
+            def score_to_output(model_output, guidance_score, indices):
+                # print("guidance_score.shape", guidance_score.shape)
+                # print("model_output[0].shape", model_output[0].shape)
+                # print("indices.shape", indices.shape, indices[...,-2].shape)
+                
+                guidance_score = guidance_score.to(model_output[0].device)
+                indices = indices.to(model_output[0].device)
+                
+                b, c, d, h, w = model_output[0].shape  # c will be one
+                guidance_mask = torch.zeros_like(model_output[0], dtype=model_output[0].dtype, device=model_output[0].device)
+                
+                # Generate indices for the b and c dimensions
+                b_indices = torch.arange(b).view(b, 1, 1, 1).expand(-1, c, indices.shape[2], 1)
+                c_indices = torch.arange(c).view(1, c, 1, 1).expand(b, -1, indices.shape[2], 1)
+
+                # Use advanced indexing to set values
+                # Flatten the last three dimensions in A to use with flat indices
+                guidance_mask_flat = guidance_mask.view(b, c, -1)
+
+                # Calculate flat indices for the last three dimensions
+                flat_indices = indices[..., 0]*w*d + indices[..., 1]*d + indices[..., 2]
+
+                # Set the values using the generated indices
+                guidance_mask_flat[b_indices, c_indices, flat_indices.unsqueeze(-1)] = guidance_score.unsqueeze(0)
+
+                # Reshape A_flat back if needed (it's not actually necessary here, 
+                # since we're modifying A in place through its view)
+                guidance_mask = guidance_mask_flat.view(b, c, h, w, d)
+
+                model_output[0] = model_output[0] + guidance_mask
+                return model_output
+                    
+            # input_to_state([q_trans, q_rot_grip, q_ignore_collisions])
+
+            guidance_output = guide([q_trans, q_rot_grip, q_ignore_collisions], guidance_func_file,
+                                               input_to_state, score_to_output)
+            # print("guidance_output: ", guidance_output[0].shape, guidance_output[1].shape, guidance_output[2].shape)
+            q_trans_guided, \
+            q_rot_grip_guided,\
+            q_ignore_collisions_guided = guidance_output
+
+            # print("assingned")
+            coords, \
+            rot_and_grip_indicies, \
+            ignore_collisions = self._q.choose_highest_action(q_trans_guided, q_rot_grip_guided, q_ignore_collisions_guided)
+
+            print( "DONE", coords.shape, rot_and_grip_indicies.shape, ignore_collisions.shape)
+
 
         rot_grip_action = rot_and_grip_indicies if q_rot_grip is not None else None
         ignore_collisions_action = ignore_collisions.int() if ignore_collisions is not None else None
